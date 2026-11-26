@@ -18,7 +18,33 @@
 
 /* Rellena servaddr con la IP de 'nombre' (getaddrinfo) y htons(PUERTO).
    Devuelve 0 si va bien, -1 si no se puede resolver. */
-int resolver_servidor(char *nombre, struct sockaddr_in *servaddr);
+int resolver_servidor(char *nombre, struct sockaddr_in *servaddr)
+{
+    struct addrinfo hints, *res;
+
+    /* 1. Estructura destino a cero (sizeof(*servaddr): la estructura, no el puntero) */
+    memset(servaddr, 0, sizeof(*servaddr));
+    servaddr->sin_family = AF_INET;
+
+    /* 2. La "pregunta": solo direcciones IPv4 */
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+
+    /* 3. Traducir el nombre a IP */
+    if (getaddrinfo(nombre, NULL, &hints, &res) != 0)
+        return -1;
+
+    /* 4. Copiar la IP del primer resultado (cast de sockaddr genérico a sockaddr_in) */
+    servaddr->sin_addr = ((struct sockaddr_in *) res->ai_addr)->sin_addr;
+
+    /* 5. Liberar la lista que reservó getaddrinfo (después de copiar) */
+    freeaddrinfo(res);
+
+    /* 6. Puerto del servidor en orden de red */
+    servaddr->sin_port = htons(PUERTO);
+
+    return 0;
+}
 
 /* Todo el cliente TCP: socket, connect, getsockname, abrir <puerto>.txt,
    bucle de órdenes (send + leer respuesta) y cierre (shutdown + close). */
@@ -31,7 +57,36 @@ void clienteUDP(char *servidor, struct sockaddr_in servaddr, char *fich_ordenes)
 /* Convierte una línea de ordenes.txt ("GET /index.html k") en la petición HTTP
    completa, acabada en la línea vacía. Pone *cerrar = 1 si la orden lleva 'c'.
    Devuelve -1 si la línea está vacía o mal formada. */
-int construir_peticion(char *linea, char *servidor, char *peticion, int *cerrar);
+int construir_peticion(char *linea, char *servidor, char *peticion, int *cerrar)
+{
+    char metodo[MAX_LINEA], ruta[MAX_LINEA], flag[8];
+    int n;
+
+    *cerrar = 0;
+
+    /* 1. Quitar el \n (y el \r de Windows) del final */
+    linea[strcspn(linea, "\r\n")] = '\0';
+
+    /* 2. Separar la línea en sus palabras */
+    n = sscanf(linea, "%s %s %7s", metodo, ruta, flag);
+    if (n < 2)
+        return -1;                       /* línea vacía o incompleta */
+
+    /* 3. Primera línea + Host */
+    sprintf(peticion, "%s %s HTTP/1.1\r\nHost: %s\r\n", metodo, ruta, servidor);
+
+    /* 4. Cabecera Connection según el flag */
+    if (n == 3 && strcmp(flag, "k") == 0)
+        strcat(peticion, "Connection: keep-alive\r\n");
+    else if (n == 3 && strcmp(flag, "c") == 0) {
+        strcat(peticion, "Connection: close\r\n");
+        *cerrar = 1;
+    }
+
+    /* 5. Línea vacía: fin de la petición */
+    strcat(peticion, "\r\n");
+    return 0;
+}
 
 /* TCP: lee del socket una línea acabada en \r\n, byte a byte, y la deja sin el \r\n.
    Devuelve su longitud (0 = línea vacía = fin de cabeceras) o -1 si el servidor cerró. */
