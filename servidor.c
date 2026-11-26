@@ -13,17 +13,20 @@
 #define PUERTO 17278  // puerto donde escuchara el servidor
 #define TAM_BUFFER 10 // para guardar una peticion o respuesta entera en html
 #define MAX_LINEA 516 // protocolo no puede pasar de 516 bytes por linea
-
+int FIN = 0;
+void finalizar(){FIN = 1;};
 int main(int argc, char *argv[]) {
   int FIN = 0;
   int ls_TCP;
   struct sockaddr_in infoSocket;
   // sigaction
   struct sigaction sa = {.sa_handler = SIG_IGN};
-  void finalizar(){FIN = 1};
-  struct sigaction vec = {vec.sa_flags = 0
-                                         // añadir finalizar
-                                         vec.sa_handler = finalizar()};
+  
+  struct sigaction vec = {
+    .sa_flags = 0,
+    // añadir finalizar
+    .sa_handler = finalizar
+};
 
   ls_TCP = socket(AF_INET, SOCK_STREAM, 0);
   if (ls_TCP == -1) {
