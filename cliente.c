@@ -16,6 +16,7 @@
 #define TIMEOUT     5       /* UDP: segundos esperando respuesta */
 #define REINTENTOS  3       /* UDP: veces que se reenvía */
 
+/* ---------- Prototipos (arriba, para que el orden de las funciones dé igual) ---------- */
 int  resolver_servidor(char *nombre, struct sockaddr_in *servaddr);
 void clienteTCP(char *servidor, struct sockaddr_in servaddr, char *fich_ordenes);
 void clienteUDP(char *servidor, struct sockaddr_in servaddr, char *fich_ordenes);
@@ -105,28 +106,26 @@ void clienteTCP(char *servidor, struct sockaddr_in servaddr, char *fich_ordenes)
         exit(1);
     }
 
-    /* 1b. Conectar con el servidor (FALTABA) */
+    /* 2. Conectar con el servidor (aquí se hace el saludo en 3 pasos) */
     if (connect(s, (struct sockaddr *)&servaddr, sizeof(servaddr)) == -1) {
         perror("connect");
         exit(1);
     }
 
-    /* 2. Puerto efímero: después del connect */
+    /* 3. Puerto efímero: después del connect */
     if (getsockname(s, (struct sockaddr *)&myaddr, &addrlen) == -1) {
         perror("getsockname");
         exit(1);
     }
 
-    /* 3. Abrir el fichero de salida <puerto>.txt */
+    /* 4. Abrir el fichero de salida <puerto>.txt y el de órdenes */
     sprintf(nombre_salida, "%u.txt", ntohs(myaddr.sin_port));
     if ((fsal = fopen(nombre_salida, "w")) == NULL) {
         perror("fopen");
         exit(1);
     }
-
-   
-   if ((ford = fopen(fich_ordenes, "r")) == NULL) {
-        fprintf(fsal, "Error: no se puede abrir %s\n", fich_ordenes);
+    if ((ford = fopen(fich_ordenes, "r")) == NULL) {
+        fprintf(fsal, "Error: no se puede abrir el fichero de ordenes %s\n", fich_ordenes);
         fclose(fsal);
         close(s);
         exit(1);
@@ -135,21 +134,21 @@ void clienteTCP(char *servidor, struct sockaddr_in servaddr, char *fich_ordenes)
             servidor, inet_ntoa(servaddr.sin_addr), ntohs(servaddr.sin_port),
             ntohs(myaddr.sin_port));
 
-    /* 4. Bucle de órdenes */
+    /* 5. Bucle de órdenes: una vuelta = una petición y su respuesta */
     while (!fin && fgets(linea, sizeof(linea), ford) != NULL) {
 
-        /* 4.1 Montar la petición */
+        /* 5.1 Traducir la orden a petición HTTP */
         if (construir_peticion(linea, servidor, peticion, &cerrar) == -1)
-            continue;
+            continue;                               /* línea vacía: siguiente */
         fprintf(fsal, "Cliente> %s\n", linea);
 
-        /* 4.2 Enviarla */
+        /* 5.2 Enviarla (strlen, no sizeof) */
         if (send(s, peticion, strlen(peticion), 0) == -1) {
             fprintf(fsal, "Error al enviar la peticion\n");
             break;
         }
 
-        /* 4.3 Leer las cabeceras */
+        /* 5.3 Leer las cabeceras hasta la línea vacía */
         longitud = 0;
         while ((r = leer_linea(s, cabecera, sizeof(cabecera))) > 0) {
             fprintf(fsal, "%s\n", cabecera);
@@ -164,14 +163,14 @@ void clienteTCP(char *servidor, struct sockaddr_in servaddr, char *fich_ordenes)
         }
         fprintf(fsal, "\n");
 
-        /* 4.4 Leer el cuerpo: exactamente 'longitud' bytes */
+        /* 5.4 Leer el cuerpo: exactamente 'longitud' bytes */
         if (longitud > TAM_BUFFER - 1)
             longitud = TAM_BUFFER - 1;
         leidos = 0;
         while (leidos < longitud) {
             n = recv(s, cuerpo + leidos, longitud - leidos, 0);
             if (n <= 0) {
-                fprintf(fsal, "El servidor ha cerrado antes de enviar el cuerpo\n");
+                fprintf(fsal, "El servidor ha cerrado antes de enviar todo el cuerpo\n");
                 fin = 1;
                 break;
             }
@@ -181,22 +180,144 @@ void clienteTCP(char *servidor, struct sockaddr_in servaddr, char *fich_ordenes)
         fprintf(fsal, "%s\n\n", cuerpo);
         fflush(fsal);
 
-        /* 4.5 ¿Seguir? */
+        /* 5.5 ¿Seguir? Tras un Connection: close (501 u orden con 'c') no */
         if (cerrar)
             fin = 1;
     }
 
-    /* 5. Cerrar */
-    shutdown(s, SHUT_WR);
+    /* 6. Finalización ordenada */
+    fprintf(fsal, "Fin de la comunicacion\n");
+    shutdown(s, SHUT_WR);       /* "no te mando nada más" */
     close(s);
     fclose(ford);
     fclose(fsal);
 }
 
-/* Todo el cliente UDP: de momento vacío para que compile. */
+/* Todo el cliente UDP: socket, bind al puerto 0, getsockname, abrir <puerto>.txt,
+   bucle de órdenes (sendto + recvfrom con alarm y reintentos) y close. */
 void clienteUDP(char *servidor, struct sockaddr_in servaddr, char *fich_ordenes)
 {
-    fprintf(stderr, "UDP aun no implementado\n");
+    int s;
+    struct sockaddr_in myaddr, from;
+    socklen_t addrlen = sizeof(myaddr);
+    socklen_t fromlen;
+    struct sigaction vec;
+    char nombre_salida[32];
+    FILE *fsal, *ford;
+    char linea[MAX_LINEA + 2];
+    char peticion[TAM_BUFFER];
+    char buffer[TAM_BUFFER];
+    int cerrar, intento, recibido, cc;
+
+    /* 1. Crear el socket UDP */
+    if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
+        perror("socket");
+        exit(1);
+    }
+
+    /* 2. bind a cualquier IP local y puerto 0: el sistema elige el efímero */
+    memset(&myaddr, 0, sizeof(myaddr));
+    myaddr.sin_family = AF_INET;
+    myaddr.sin_addr.s_addr = INADDR_ANY;
+    myaddr.sin_port = 0;
+    if (bind(s, (struct sockaddr *)&myaddr, sizeof(myaddr)) == -1) {
+        perror("bind");
+        exit(1);
+    }
+
+    /* 3. Puerto efímero elegido */
+    if (getsockname(s, (struct sockaddr *)&myaddr, &addrlen) == -1) {
+        perror("getsockname");
+        exit(1);
+    }
+
+    /* 4. SIGALRM para el timeout. Sin SA_RESTART: así recvfrom
+          devuelve -1 con errno == EINTR cuando salta la alarma */
+    memset(&vec, 0, sizeof(vec));
+    vec.sa_handler = manejador_alarma;
+    vec.sa_flags = 0;
+    if (sigaction(SIGALRM, &vec, NULL) == -1) {
+        perror("sigaction");
+        exit(1);
+    }
+
+    /* 5. Abrir ficheros */
+    sprintf(nombre_salida, "%u.txt", ntohs(myaddr.sin_port));
+    if ((fsal = fopen(nombre_salida, "w")) == NULL) {
+        perror("fopen");
+        exit(1);
+    }
+    if ((ford = fopen(fich_ordenes, "r")) == NULL) {
+        fprintf(fsal, "Error: no se puede abrir el fichero de ordenes %s\n", fich_ordenes);
+        fclose(fsal);
+        close(s);
+        exit(1);
+    }
+    fprintf(fsal, "Cliente UDP hacia %s (%s:%d) desde el puerto %u\n\n",
+            servidor, inet_ntoa(servaddr.sin_addr), ntohs(servaddr.sin_port),
+            ntohs(myaddr.sin_port));
+
+    /* 6. Bucle de órdenes */
+    while (fgets(linea, sizeof(linea), ford) != NULL) {
+
+        /* 6.1 Traducir la orden */
+        if (construir_peticion(linea, servidor, peticion, &cerrar) == -1)
+            continue;
+        fprintf(fsal, "Cliente> %s\n", linea);
+
+        /* 6.2 Enviar y esperar respuesta, con reintentos */
+        recibido = 0;
+        for (intento = 1; intento <= REINTENTOS && !recibido; intento++) {
+
+            if (sendto(s, peticion, strlen(peticion), 0,
+                       (struct sockaddr *)&servaddr, sizeof(servaddr)) == -1) {
+                fprintf(fsal, "Error al enviar la peticion\n");
+                break;
+            }
+
+            alarm(TIMEOUT);
+            fromlen = sizeof(from);
+            cc = recvfrom(s, buffer, TAM_BUFFER - 1, 0,
+                          (struct sockaddr *)&from, &fromlen);
+
+            if (cc == -1) {
+                if (errno == EINTR) {           /* saltó la alarma */
+                    fprintf(fsal, "Timeout: sin respuesta (intento %d de %d)\n",
+                            intento, REINTENTOS);
+                    continue;                   /* reintentar */
+                }
+                alarm(0);
+                fprintf(fsal, "Error en recvfrom\n");
+                break;
+            }
+
+            alarm(0);                           /* ha llegado: cancelar alarma */
+            recibido = 1;
+        }
+
+        if (!recibido) {
+            fprintf(fsal, "Sin respuesta del servidor\n\n");
+            fflush(fsal);
+            continue;                           /* siguiente orden */
+        }
+
+        /* 6.3 Guardar la respuesta (llega entera en un datagrama) */
+        buffer[cc] = '\0';
+        fprintf(fsal, "%s\n\n", buffer);
+        fflush(fsal);
+
+        /* 6.4 ¿Seguir? */
+        if (strstr(buffer, "Connection: close") != NULL)
+            cerrar = 1;
+        if (cerrar)
+            break;
+    }
+
+    /* 7. Fin (en UDP no hay shutdown: no hay conexión) */
+    fprintf(fsal, "Fin de la comunicacion\n");
+    close(s);
+    fclose(ford);
+    fclose(fsal);
 }
 
 /* Convierte una línea de ordenes.txt ("GET /index.html k") en la petición HTTP
@@ -261,4 +382,5 @@ int leer_linea(int s, char *linea, int max)
 /* Manejador de SIGALRM: vacío. Solo sirve para interrumpir el recvfrom (EINTR). */
 void manejador_alarma(int sig)
 {
+    (void)sig;   /* no hace nada: solo sirve para interrumpir el recvfrom */
 }
