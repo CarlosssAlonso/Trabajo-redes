@@ -196,4 +196,223 @@ void clienteTCP(char *servidor, struct sockaddr_in servaddr, char *fich_ordenes)
             leidos = 0;
             while (leidos < longitud) {
                 n = recv(s, cuerpo + leidos, longitud - leidos, 0);
-                if (n
+                if (n <= 0) {
+                    fprintf(fsal, "El servidor ha cerrado antes de enviar todo el cuerpo\n");
+                    conexion_rota = 1;
+                    break;
+                }
+                leidos += n;
+            }
+            cuerpo[leidos] = '\0';
+            fprintf(fsal, "%s\n\n", cuerpo);
+        }
+        fflush(fsal);
+
+        /* 4.6 Si la conexión se cierra (Connection: close o error), cerrar el
+               socket; si quedan órdenes, la siguiente vuelta reconecta */
+        if (cerrar || conexion_rota) {
+            shutdown(s, SHUT_WR);
+            close(s);
+            s = -1;
+            fprintf(fsal, "--- Conexion cerrada ---\n\n");
+        }
+    }
+
+    /* 5. Finalización ordenada */
+    if (s != -1) {
+        shutdown(s, SHUT_WR);       /* "no te mando nada más" */
+        close(s);
+    }
+    fprintf(fsal, "Fin de la comunicacion\n");
+    fclose(ford);
+    fclose(fsal);
+}
+
+/* Todo el cliente UDP: socket, bind al puerto 0, getsockname, abrir <puerto>.txt,
+   bucle de órdenes (sendto + recvfrom con alarm y reintentos) y close. */
+void clienteUDP(char *servidor, struct sockaddr_in servaddr, char *fich_ordenes)
+{
+    int s;
+    struct sockaddr_in myaddr, from;
+    socklen_t addrlen = sizeof(myaddr);
+    socklen_t fromlen;
+    struct sigaction vec;
+    char nombre_salida[32];
+    FILE *fsal, *ford;
+    char linea[MAX_LINEA + 2];
+    char peticion[TAM_BUFFER];
+    char buffer[TAM_BUFFER];
+    int cerrar, intento, recibido, cc;
+
+    /* 1. Crear el socket UDP */
+    if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
+        perror("socket");
+        exit(1);
+    }
+
+    /* 2. bind a cualquier IP local y puerto 0: el sistema elige el efímero */
+    memset(&myaddr, 0, sizeof(myaddr));
+    myaddr.sin_family = AF_INET;
+    myaddr.sin_addr.s_addr = INADDR_ANY;
+    myaddr.sin_port = 0;
+    if (bind(s, (struct sockaddr *)&myaddr, sizeof(myaddr)) == -1) {
+        perror("bind");
+        exit(1);
+    }
+
+    /* 3. Puerto efímero elegido */
+    if (getsockname(s, (struct sockaddr *)&myaddr, &addrlen) == -1) {
+        perror("getsockname");
+        exit(1);
+    }
+
+    /* 4. SIGALRM para el timeout. Sin SA_RESTART: así recvfrom
+          devuelve -1 con errno == EINTR cuando salta la alarma */
+    memset(&vec, 0, sizeof(vec));
+    vec.sa_handler = manejador_alarma;
+    vec.sa_flags = 0;
+    if (sigaction(SIGALRM, &vec, NULL) == -1) {
+        perror("sigaction");
+        exit(1);
+    }
+
+    /* 5. Abrir ficheros */
+    sprintf(nombre_salida, "%u.txt", ntohs(myaddr.sin_port));
+    if ((fsal = fopen(nombre_salida, "w")) == NULL) {
+        perror("fopen");
+        exit(1);
+    }
+    if ((ford = fopen(fich_ordenes, "r")) == NULL) {
+        fprintf(fsal, "Error: no se puede abrir el fichero de ordenes %s\n", fich_ordenes);
+        fclose(fsal);
+        close(s);
+        exit(1);
+    }
+    fprintf(fsal, "Cliente UDP hacia %s (%s:%d) desde el puerto %u\n\n",
+            servidor, inet_ntoa(servaddr.sin_addr), ntohs(servaddr.sin_port),
+            ntohs(myaddr.sin_port));
+
+    /* 6. Bucle de órdenes */
+    while (fgets(linea, sizeof(linea), ford) != NULL) {
+
+        /* 6.1 Traducir la orden */
+        if (construir_peticion(linea, servidor, peticion, &cerrar) == -1)
+            continue;
+        fprintf(fsal, "Cliente> %s\n", linea);
+
+        /* 6.2 Enviar y esperar respuesta, con reintentos */
+        recibido = 0;
+        for (intento = 1; intento <= REINTENTOS && !recibido; intento++) {
+
+            if (sendto(s, peticion, strlen(peticion), 0,
+                       (struct sockaddr *)&servaddr, sizeof(servaddr)) == -1) {
+                fprintf(fsal, "Error al enviar la peticion\n");
+                break;
+            }
+
+            alarm(TIMEOUT);
+            fromlen = sizeof(from);
+            cc = recvfrom(s, buffer, TAM_BUFFER - 1, 0,
+                          (struct sockaddr *)&from, &fromlen);
+
+            if (cc == -1) {
+                if (errno == EINTR) {           /* saltó la alarma */
+                    fprintf(fsal, "Timeout: sin respuesta (intento %d de %d)\n",
+                            intento, REINTENTOS);
+                    continue;                   /* reintentar */
+                }
+                alarm(0);
+                fprintf(fsal, "Error en recvfrom\n");
+                break;
+            }
+
+            alarm(0);                           /* ha llegado: cancelar alarma */
+            recibido = 1;
+        }
+
+        if (!recibido) {
+            fprintf(fsal, "Sin respuesta del servidor\n\n");
+            fflush(fsal);
+            continue;                           /* siguiente orden */
+        }
+
+        /* 6.3 Guardar la respuesta (llega entera en un datagrama) */
+        buffer[cc] = '\0';
+        fprintf(fsal, "%s\n\n", buffer);
+        fflush(fsal);
+
+        /* 6.4 En UDP no hay conexión que cerrar: aunque la respuesta diga
+               "Connection: close" se sigue con la siguiente orden */
+    }
+
+    /* 7. Fin (en UDP no hay shutdown: no hay conexión) */
+    fprintf(fsal, "Fin de la comunicacion\n");
+    close(s);
+    fclose(ford);
+    fclose(fsal);
+}
+
+/* Convierte una línea de ordenes.txt ("GET /index.html k") en la petición HTTP
+   completa, acabada en la línea vacía. Pone *cerrar = 1 si la orden lleva 'c'.
+   Devuelve -1 si la línea está vacía o mal formada. */
+int construir_peticion(char *linea, char *servidor, char *peticion, int *cerrar)
+{
+    char metodo[MAX_LINEA], ruta[MAX_LINEA], flag[8];
+    int n;
+
+    *cerrar = 0;
+
+    /* 1. Quitar el \n (y el \r de Windows) del final */
+    linea[strcspn(linea, "\r\n")] = '\0';
+
+    /* 2. Separar la línea en sus palabras */
+    n = sscanf(linea, "%s %s %7s", metodo, ruta, flag);
+    if (n < 2)
+        return -1;                       /* línea vacía o incompleta */
+
+    /* 3. Primera línea + Host */
+    sprintf(peticion, "%s %s HTTP/1.1\r\nHost: %s\r\n", metodo, ruta, servidor);
+
+    /* 4. Cabecera Connection según el flag */
+    if (n == 3 && strcmp(flag, "k") == 0)
+        strcat(peticion, "Connection: keep-alive\r\n");
+    else if (n == 3 && strcmp(flag, "c") == 0) {
+        strcat(peticion, "Connection: close\r\n");
+        *cerrar = 1;
+    }
+
+    /* 5. Línea vacía: fin de la petición */
+    strcat(peticion, "\r\n");
+    return 0;
+}
+
+/* TCP: lee del socket una línea acabada en \r\n, byte a byte, y la deja sin el \r\n.
+   Devuelve su longitud (0 = línea vacía = fin de cabeceras) o -1 si el servidor cerró. */
+int leer_linea(int s, char *linea, int max)
+{
+    char c;
+    int i = 0;
+    int n;
+
+    while (1) {
+        n = recv(s, &c, 1, 0);      /* leer UN byte */
+        if (n <= 0)
+            return -1;              /* servidor cerró (0) o error (-1) */
+        if (c == '\n')
+            break;                  /* fin de línea */
+        if (i < max - 1)
+            linea[i++] = c;         /* guardarlo (sin desbordar) */
+    }
+
+    if (i > 0 && linea[i - 1] == '\r')
+        i--;                        /* quitar el \r del final */
+
+    linea[i] = '\0';                /* cerrar la cadena */
+    return i;                       /* longitud: 0 = línea vacía */
+}
+
+/* Manejador de SIGALRM: vacío. Solo sirve para interrumpir el recvfrom (EINTR). */
+void manejador_alarma(int sig)
+{
+    (void)sig;   /* no hace nada: solo sirve para interrumpir el recvfrom */
+}
